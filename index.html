@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VoicingFour — Live Piano/Guitar Comping Desk</title>
+<style>
+body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
+.container { max-width: 800px; margin: 0 auto; }
+h1 { font-size: 1.8em; }
+label { display: block; margin: 8px 0 4px; }
+input, select, button { padding: 8px; font-size: 1em; }
+button { background: #0a0; color: #000; border: none; cursor: pointer; margin: 4px; }
+button:disabled { opacity: 0.5; }
+.chords { display: flex; gap: 10px; }
+.chords input { width: 60px; }
+.status { margin: 10px 0; padding: 10px; background: #222; }
+.playhead { height: 4px; background: #333; margin: 10px 0; }
+.playhead > div { height: 100%; background: #0f0; width: 0%; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>VoicingFour</h1>
+<p>Four-bar live piano/guitar voicing desk. Live FluidR3 chairs lock rhythmic comps to your 4-chord progression so the harmonic bed finally has motion.</p>
+<p>Distinct from CompFour (static blocks), WalkFour (bass), StabFour (horns).</p>
+
+<div id="tap-to-start" style="display:none; padding:20px; background:#333; text-align:center;">
+<button id="start-audio">Tap to start audio</button>
+<p>iOS: silent switch mutes Web Audio.</p>
+</div>
+
+<div id="app" style="display:none;">
+<label>BPM (60–180)</label>
+<input type="number" id="bpm" min="60" max="180" value="92">
+
+<label>Key</label>
+<select id="key">
+<option>C</option><option>Am</option><option>G</option><option>Em</option><option>F</option><option>Dm</option>
+<option>D</option><option>Bm</option><option>A</option><option>F#m</option><option>E</option><option>C#m</option>
+<option>B</option><option>G#m</option><option>Bb</option><option>Gm</option><option>Ab</option><option>Fm</option>
+</select>
+
+<label>4-chord progression (e.g. Am F C G)</label>
+<div class="chords">
+<input id="c1" value="Am"> <input id="c2" value="F"> <input id="c3" value="C"> <input id="c4" value="G">
+</div>
+
+<label>Recipe</label>
+<select id="recipe">
+<option value="block">Block voicings</option>
+<option value="arp">Arpeggiated</option>
+<option value="rhy">Rhythmic stabs</option>
+<option value="jazz">Jazz comp</option>
+</select>
+
+<label>Chair</label>
+<select id="chair">
+<option value="piano">Piano</option>
+<option value="nylon">Nylon Guitar</option>
+<option value="steel">Steel Guitar</option>
+</select>
+
+<button id="play">Play</button>
+<button id="stop">Stop</button>
+<button id="export-wav">Export WAV</button>
+<button id="export-mid">Export MIDI</button>
+
+<div class="status" id="status">Ready</div>
+<div class="playhead"><div id="playhead-bar"></div></div>
+</div>
+</div>
+
+<script>
+const LOOKAHEAD_MS = 25;
+const SCHEDULE_AHEAD = 0.12;
+const SAMPLE_RATE = 48000;
+
+const SAMPLE_BASE = "https://cdn.jsdelivr.net/gh/gleitz/midi-js-soundfonts@044fab8e1456bfafc5776e86dfd6bb8697149aef/FluidR3_GM/";
+
+const INSTRUMENTS = {
+  piano: "acoustic_grand_piano-mp3",
+  nylon: "acoustic_guitar_nylon-mp3",
+  steel: "acoustic_guitar_steel-mp3"
+};
+
+const NOTE_MAP = { C:0, "C#":1, Db:1, D:2, "D#":3, Eb:3, E:4, F:5, "F#":6, Gb:6, G:7, "G#":8, Ab:8, A:9, "A#":10, Bb:10, B:11 };
+
+let state = {
+  bpm: 92,
+  key: "C",
+  chords: ["Am", "F", "C", "G"],
+  recipe: "block",
+  chair: "piano",
+  bars: 4,
+  muted: false
+};
+
+let audioCtx = null;
+let nextStepTime = 0;
+let step = 0;
+let timerId = null;
+let activeSources = [];
+let sampleBuffers = {};
+let isPlaying = false;
+let startTime = 0;
+
+function noteToMidi(note) {
+  const m = note.match(/([A-G][#b]?)(\d)/);
+  if (!m) return 60;
+  const n = NOTE_MAP[m[1]];
+  const oct = parseInt(m[2]);
+  return (oct + 1) * 12 + n;
+}
+
+function parseChord(chord) {
+  const root = chord.replace(/m$/, "");
+  const isMinor = chord.endsWith("m");
+  const midi = noteToMidi(root + "3");
+  return { root: midi, minor: isMinor };
+}
+
+function getVoicing(chord, recipe, stepInBar) {
+  const { root, minor } = parseChord(chord);
+  const third = minor ? root + 3 : root + 4;
+  const fifth = root + 7;
+  if (recipe === "block") return [root, third, fifth];
+  if (recipe === "arp") {
+    const notes = [root, third, fifth, root + 12];
+    return [notes[stepInBar % 4]];
+  }
+  if (recipe === "rhy") {
+    if (stepInBar % 4 === 0 || stepInBar % 4 === 2) return [root, third, fifth];
+    return [];
+  }
+  const seventh = minor ? root + 10 : root + 11;
+  return [third, fifth, seventh];
+}
+
+function scheduler() {
+  if (!audioCtx) return;
+  while (nextStepTime < audioCtx.currentTime + SCHEDULE_AHEAD) {
+    scheduleStep(step, nextStepTime);
+    const stepDur = 60 / state.bpm / 4;
+    nextStepTime += stepDur;
+    step = (step + 1) % (state.bars * 16);
+  }
+}
+
+function scheduleStep(step, time) {
+  const bar = Math.floor(step / 16);
+  const stepInBar = step % 16;
+  const chordIdx = Math.floor(stepInBar / 4) % 4;
+  const chord = state.chords[chordIdx];
+  const notes = getVoicing(chord, state.recipe, stepInBar);
+  if (notes.length === 0) return;
+
+  const instrument = INSTRUMENTS[state.chair];
+  notes.forEach(midi => {
+    const noteName = midiToNote(midi);
+    const buffer = sampleBuffers[instrument]?.[noteName];
+    if (!buffer) return;
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.7, time);
+    gain.gain.linearRampToValueAtTime(0, time + 0.2);
+    src.connect(gain);
+    gain.connect(audioCtx.destination);
+    src.start(time);
+    src.stop(time + 0.3);
+    activeSources.push(src);
+  });
+}
+
+function midiToNote(midi) {
+  const notes = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+  const oct = Math.floor(midi / 12) - 1;
+  const n = notes[midi % 12];
+  return n + oct;
+}
+
+async function preload() {
+  const status = document.getElementById("status");
+  status.textContent = "Loading samples...";
+  const instruments = Object.values(INSTRUMENTS);
+  const notes = ["C3","E3","G3","C4","E4","G4","C5"];
+  let loaded = 0;
+  const total = instruments.length * notes.length;
+  for (const inst of instruments) {
+    sampleBuffers[inst] = {};
+    for (const note of notes) {
+      try {
+        const url = `${SAMPLE_BASE}${inst}/${note}.mp3`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error("missing " + note);
+        const ab = await resp.arrayBuffer();
+        const buf = await audioCtx.decodeAudioData(ab.slice(0));
+        sampleBuffers[inst][note] = buf;
+        loaded++;
+        status.textContent = `Loaded ${loaded}/${total}`;
+      } catch (e) {
+        status.textContent = `Missing: ${inst} ${note}`;
+        return;
+      }
+    }
+  }
+  status.textContent = "Ready";
+  document.getElementById("app").style.display = "block";
+}
+
+function start() {
+  if (isPlaying) return;
+  isPlaying = true;
+  nextStepTime = audioCtx.currentTime + 0.1;
+  step = 0;
+  startTime = audioCtx.currentTime;
+  timerId = setInterval(scheduler, LOOKAHEAD_MS);
+  requestAnimationFrame(updatePlayhead);
+}
+
+function stop() {
+  isPlaying = false;
+  clearInterval(timerId);
+  activeSources.forEach(s => { try { s.stop(); } catch(e){} });
+  activeSources = [];
+}
+
+function updatePlayhead() {
+  if (!isPlaying || !audioCtx) return;
+  const elapsed = audioCtx.currentTime - startTime;
+  const total = state.bars * 4 * 60 / state.bpm;
+  const pct = (elapsed % total) / total * 100;
+  document.getElementById("playhead-bar").style.width = pct + "%";
+  requestAnimationFrame(updatePlayhead);
+}
+
+document.getElementById("start-audio").onclick = async () => {
+  audioCtx = new AudioContext();
+  await audioCtx.resume();
+  document.getElementById("tap-to-start").style.display = "none";
+  await preload();
+};
+
+document.getElementById("play").onclick = start;
+document.getElementById("stop").onclick = stop;
+
+document.getElementById("bpm").onchange = (e) => { state.bpm = parseInt(e.target.value); localStorage.setItem("voicingfour", JSON.stringify(state)); };
+document.getElementById("key").onchange = (e) => { state.key = e.target.value; localStorage.setItem("voicingfour", JSON.stringify(state)); };
+document.getElementById("c1").onchange = (e) => { state.chords[0] = e.target.value; localStorage.setItem("voicingfour", JSON.stringify(state)); };
+
+const saved = localStorage.getItem("voicingfour");
+if (saved) {
+  Object.assign(state, JSON.parse(saved));
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stop();
+});
+
+if (!audioCtx || audioCtx.state === "suspended") {
+  document.getElementById("tap-to-start").style.display = "block";
+} else {
+  preload();
+}
+</script>
+</body>
+</html>
